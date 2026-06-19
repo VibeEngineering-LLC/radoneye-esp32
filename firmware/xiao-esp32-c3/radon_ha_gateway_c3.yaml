@@ -1,0 +1,718 @@
+# ══════════════════════════════════════════════════════════════════════
+#  radon_ha_gateway_c3.yaml — RadonEye Plus2 → Home Assistant
+#  v2.1-c3 — порт на Seeed Studio XIAO ESP32C3 + Народмон-инфраструктура (по умолчанию ВЫКЛ)
+#
+#  БАЗА: radon_ha_gateway.yaml v2.0 (ESP32-DevKitC)
+#  ОТЛИЧИЯ: board=seeed_xiao_esp32c3, variant=esp32c3, framework=arduino (esp-idf не работает на Windows без MSYS2), build_path отдельный
+#
+#  Протокол RadonEye Plus2 (live-verified 2026-06-15, plus2_protocol.md):
+#    Service UUID: 00001523-1212-efde-1523-785feabcd123
+#    TX (write):   00001524-1212-efde-1523-785feabcd123
+#    RX (notify):  00001525-1212-efde-1523-785feabcd123
+#    0x50 [2:4]  uint16 LE Bq/m3 (instant radon)
+#    0x51 [4:8]  u32 LE uptime min, [18:20] live mm:ss
+#
+#  Народмон-инфраструктура (step3 2026-06-17, по умолчанию ВЫКЛ):
+#    - switch narodmon_enabled — restore_mode: ALWAYS_OFF (HARD-правило проекта:
+#      выключатель Народмона ВСЕГДА возвращается в OFF после reboot/safe-mode/factory_reset).
+#    - select narodmon_method (HTTP GET / HTTP POST / HTTPS POST / JSON POST, дефолт HTTP GET).
+#    - button narodmon_send_now — ручной триггер.
+#    - text nm_radon=RR1, nm_temp=T1, nm_hum=H1 (имена метрик Народмона).
+#    - script send_narodmon — 4 ветки по протоколам, guarded by wifi.connected +
+#      !std::isnan(s_radon.state).
+#    - interval 600s — авто-отправка ТОЛЬКО при narodmon_enabled.state == true
+#      (опрос радона = poll_interval_min, дефолт 10 мин → отправка раз в 10 мин достаточна).
+#    - http_request (verify_ssl: false, timeout 5s).
+#    - time SNTP — был ранее, нужен для HTTPS handshake.
+# ══════════════════════════════════════════════════════════════════════
+
+substitutions:
+  device_name:    radon-gw
+  device_friendly: "RadonEye HA Gateway"
+  radon_svc: "00001523-1212-efde-1523-785feabcd123"
+  radon_tx:  "00001524-1212-efde-1523-785feabcd123"
+  radon_rx:  "00001525-1212-efde-1523-785feabcd123"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${device_friendly}
+  min_version: 2025.8.0
+  build_path: D:/esp32_radon_build/radon-gw-c3
+
+esp32:
+  board: seeed_xiao_esp32c3
+  variant: esp32c3
+  framework:
+    type: arduino
+
+logger:
+  level: INFO
+  baud_rate: 115200
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  ap:
+    ssid: "radon-gw Fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+  - platform: web_server
+
+web_server:
+  version: 3
+  port: 80
+  auth:
+    username: radon
+    password: !secret ota_password
+  # ⚠ HARD-правило проекта = `log: false` (json:111 / near-OOM при SSE+log на ESP32).
+  # ИСКЛЮЧЕНИЕ для C3-шлюза радона: `log: true` оставлено намеренно (2026-06-17)
+  # для нативной вкладки логов в Web UI. Если на C3 пойдут ребуты / json:111 / OOM —
+  # вернуть `false`.
+  log: true
+  sorting_groups:
+    - id: sg_sensors
+      name: "Показания радона"
+      sorting_weight: 10
+    - id: sg_ble
+      name: "Статус BLE"
+      sorting_weight: 20
+    - id: sg_actions
+      name: "Действия"
+      sorting_weight: 30
+    - id: sg_narodmon
+      name: "Народмон (выгрузка)"
+      sorting_weight: 35
+    - id: sg_diag
+      name: "Диагностика"
+      sorting_weight: 40
+
+mdns:
+  disabled: false
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Moscow
+
+http_request:
+  verify_ssl: false                  # на arduino-фреймворке CA-bundle не подключён
+  timeout: 5s
+  useragent: "esphome-radon-gw-c3/2.1"
+
+# ── BLE tracker: 640ms/32ms duty ~5% — проверено на Radex (esp-idf, ble_client) ──
+# Дефолт esp-idf (320/30, ~9.4%) — Handshake Failed при активном BLE connection.
+# 600/180 (30%) — Auth Expired. 640/32 (~5%) — стабильно (INC-12).
+esp32_ble_tracker:
+  scan_parameters:
+    interval: 640ms
+    window: 32ms
+    active: true
+
+# ── BT proxy — плата заодно передаёт все BLE устройства в HA ──────────
+bluetooth_proxy:
+  active: true
+
+# ── BLE клиент RadonEye Plus2 ─────────────────────────────────────────
+ble_client:
+  - mac_address: !secret radon1_mac
+    id: ble_radon
+    auto_connect: true
+    on_connect:
+      - lambda: ESP_LOGI("radon", "RadonEye Plus2 connected");
+      - delay: 600ms
+      - script.execute: poll_radon
+    on_disconnect:
+      - lambda: |-
+          ESP_LOGI("radon", "RadonEye Plus2 disconnected");
+
+globals:
+  - id: g_radon_bq
+    type: float
+    restore_value: true
+    initial_value: "0.0"
+  # ── Кольцевой буфер для среднего за час (фикс. размер — урок Radex json:111) ──
+  # 72 слота с запасом: при опросе 1 раз/мин = 60/час, при 10 мин = 6/час.
+  - id: g_hist_v
+    type: float[72]
+    restore_value: false
+  - id: g_hist_t
+    type: uint32_t[72]
+    restore_value: false
+  - id: g_hist_head
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: g_hist_cnt
+    type: int
+    restore_value: false
+    initial_value: "0"
+  # Народмон: тело текущего POST/GET (формируется в send_narodmon, используется
+  # в http_request.get/post lambda-аргументах).
+  - id: g_nm_body
+    type: std::string
+    restore_value: false
+
+# ══════════════════════════════════════════════════════════════════════
+#  SENSORS
+# ══════════════════════════════════════════════════════════════════════
+sensor:
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: ble_radon
+    name: "Радон"
+    id: s_radon
+    service_uuid: ${radon_svc}
+    characteristic_uuid: ${radon_rx}
+    notify: true
+    unit_of_measurement: "Bq/m³"
+    accuracy_decimals: 0
+    icon: "mdi:radioactive"
+    state_class: measurement
+    web_server:
+      sorting_group_id: sg_sensors
+    lambda: |-
+      if (x.size() < 2) return NAN;
+
+      // ── РАЗВЕДКА (временно): hex-дамп сырого кадра по опкоду ──
+      // Цель — найти в live-кадрах влажность (H:42 = 0x2A) и температуру
+      // (T=24.0 → 0x18 целое / 0x18 0x00 в Q8.8). При известных T/H с дисплея
+      // ищем эти байты глазами в web UI. После локализации блок удалить.
+      {
+        char hb[8]; std::string hs;
+        size_t n = x.size() < 20 ? x.size() : 20;
+        for (size_t i = 0; i < n; i++) { snprintf(hb, sizeof(hb), "%02X ", x[i]); hs += hb; }
+        if (x[0] == 0x50)      id(raw_0x50).publish_state(hs);
+        else if (x[0] == 0x51) id(raw_0x51).publish_state(hs);
+        else if (x[0] == 0x54) id(raw_0x54).publish_state(hs);
+        ESP_LOGI("radon", "RAW %02X: %s", x[0], hs.c_str());
+      }
+
+      // 0x54: config blob (fw + настройки) — только дамп для разведки
+      if (x[0] == 0x54) return NAN;
+
+      // 0x51: uptime [4:8] u32 LE, влажность [12], температура [13], часы [18:20]
+      if (x[0] == 0x51 && x.size() >= 20) {
+        uint32_t up = (uint32_t)x[4] | ((uint32_t)x[5]<<8)
+                    | ((uint32_t)x[6]<<16) | ((uint32_t)x[7]<<24);
+        id(s_uptime_min).publish_state((float)up);
+        // Температура: байт [13] целое °C — ПОДТВЕРЖДЕНО живым кадром (0x18=24 =
+        // дисплей T(C):24.0; ист. сверка 0x19/0x1A = 25/26°C май-июнь). Дробной части нет.
+        id(s_temp).publish_state((float)x[13]);
+        // Влажность: байт [12] × 0.25 — ГИПОТЕЗА масштаба (0xA9=169 → 42.25 ≈ дисплей H:42;
+        // ист. 0xAA/A8/A7 → ~42%). Проверяется сравнением с дисплеем при разной влажности.
+        id(s_humidity).publish_state((float)x[12] * 0.25f);
+        char tbuf[8];
+        snprintf(tbuf, sizeof(tbuf), ":%02d:%02d", (int)x[18], (int)x[19]);
+        id(radon_clock).publish_state(std::string(tbuf));
+        return NAN;
+      }
+      // 0x50: instant radon [2:4] uint16 LE Bq/m3
+      if (x[0] != 0x50 || x.size() < 4) return NAN;
+      uint16_t bq_raw = (uint16_t)x[2] | ((uint16_t)x[3] << 8);
+      if (bq_raw > 9999) return NAN;
+      float bq = (float)bq_raw;
+      id(g_radon_bq) = bq;
+
+      // Peak [12:14] u16 LE Bq/m³ — подтверждён дисплеем (Peak:18 ↔ 0x12 в кадре).
+      // Count [14:16] u16 LE — номер замера, подтверждён дисплеем (Count:2 ↔ 0x02).
+      if (x.size() >= 16) {
+        uint16_t peak  = (uint16_t)x[12] | ((uint16_t)x[13] << 8);
+        uint16_t cnt   = (uint16_t)x[14] | ((uint16_t)x[15] << 8);
+        if (peak <= 9999) id(s_peak).publish_state((float)peak);
+        if (cnt  <= 9999) id(s_count).publish_state((float)cnt);
+      }
+
+      // ── Мощность дозы: ингаляционная эфф. доза от радона (НЕ гамма-фон!) ──
+      // dose[мкЗв/ч] = radon[Bq/m³] × k[нЗв/ч на Bq/m³] / 1000. k — настраивается.
+      id(s_dose).publish_state(bq * id(dose_coeff).state / 1000.0f);
+
+      // ── Кольцевой буфер → среднее радона за последний час ──
+      uint32_t now_s = millis() / 1000;
+      int hd = id(g_hist_head);
+      id(g_hist_v)[hd] = bq;
+      id(g_hist_t)[hd] = now_s;
+      id(g_hist_head) = (hd + 1) % 72;
+      if (id(g_hist_cnt) < 72) id(g_hist_cnt) += 1;
+      float sum = 0; int cnt = 0;
+      for (int i = 0; i < id(g_hist_cnt); i++) {
+        if (now_s - id(g_hist_t)[i] <= 3600) { sum += id(g_hist_v)[i]; cnt++; }
+      }
+      if (cnt > 0) id(s_radon_1h).publish_state(sum / (float)cnt);
+
+      auto t = id(sntp_time).now();
+      if (t.is_valid()) {
+        char tbuf[20];
+        snprintf(tbuf, sizeof(tbuf), "%02d:%02d %02d.%02d",
+                 t.hour, t.minute, t.day_of_month, t.month);
+        id(radon_updated).publish_state(std::string(tbuf));
+      }
+      ESP_LOGI("radon", "RadonEye: %u Bq/m3", bq_raw);
+      return bq;
+    filters:
+      - filter_out: nan
+
+  - platform: template
+    name: "Средний радон за час"
+    id: s_radon_1h
+    unit_of_measurement: "Bq/m³"
+    accuracy_decimals: 0
+    icon: "mdi:radioactive"
+    state_class: measurement
+    update_interval: never
+    web_server:
+      sorting_group_id: sg_sensors
+
+  - platform: template
+    name: "Мощность дозы (радон)"
+    id: s_dose
+    unit_of_measurement: "мкЗв/ч"
+    accuracy_decimals: 3
+    icon: "mdi:radioactive"
+    state_class: measurement
+    update_interval: never
+    web_server:
+      sorting_group_id: sg_sensors
+
+  - platform: template
+    name: "Температура прибора"
+    id: s_temp
+    device_class: temperature
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    icon: "mdi:thermometer"
+    state_class: measurement
+    update_interval: never
+    web_server:
+      sorting_group_id: sg_sensors
+
+  - platform: template
+    name: "Влажность прибора"
+    id: s_humidity
+    device_class: humidity
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: "mdi:water-percent"
+    state_class: measurement
+    update_interval: never
+    web_server:
+      sorting_group_id: sg_sensors
+
+  - platform: template
+    name: "Uptime прибора (мин)"
+    id: s_uptime_min
+    unit_of_measurement: "мин"
+    accuracy_decimals: 0
+    icon: "mdi:timer-outline"
+    state_class: total_increasing
+    update_interval: never
+    web_server:
+      sorting_group_id: sg_sensors
+
+  - platform: template
+    name: "Пик радона (Peak)"
+    id: s_peak
+    unit_of_measurement: "Bq/m³"
+    accuracy_decimals: 0
+    icon: "mdi:chart-bell-curve-cumulative"
+    state_class: measurement
+    update_interval: never
+    web_server:
+      sorting_group_id: sg_sensors
+
+  - platform: template
+    name: "Номер замера (Count)"
+    id: s_count
+    accuracy_decimals: 0
+    icon: "mdi:counter"
+    state_class: measurement
+    update_interval: never
+    web_server:
+      sorting_group_id: sg_sensors
+
+  - platform: wifi_signal
+    name: "WiFi сигнал"
+    update_interval: 60s
+    web_server:
+      sorting_group_id: sg_diag
+
+  # Мощность BLE-сигнала RadonEye по advertisement-пакетам (нативный esp32_ble_tracker).
+  # ⚠ Caveat: пока ble_client держит активное соединение, прибор молчит в эфире →
+  # значение может «замерзнуть» на последнем adv'е до разрыва. Если так — заменим
+  # на live-RSSI самого ble_client через IDF.
+  - platform: ble_rssi
+    name: "BLE сигнал RadonEye"
+    mac_address: !secret radon1_mac
+    web_server:
+      sorting_group_id: sg_ble
+
+  - platform: uptime
+    name: "Uptime ESP32"
+    update_interval: 60s
+    web_server:
+      sorting_group_id: sg_diag
+
+binary_sensor:
+  - platform: template
+    name: "BLE RadonEye подключён"
+    id: ble_radon_connected
+    icon: "mdi:bluetooth"
+    web_server:
+      sorting_group_id: sg_ble
+    lambda: "return id(ble_radon).connected();"
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP адрес"
+      web_server:
+        sorting_group_id: sg_diag
+
+  - platform: template
+    name: "Время замера"
+    id: radon_updated
+    update_interval: never
+    icon: "mdi:clock-check-outline"
+    web_server:
+      sorting_group_id: sg_sensors
+
+  - platform: template
+    name: "Часы прибора mm:ss"
+    id: radon_clock
+    update_interval: never
+    icon: "mdi:clock-time-five-outline"
+    web_server:
+      sorting_group_id: sg_sensors
+
+  # ── РАЗВЕДКА (временно): сырые кадры для поиска влажности/температуры ──
+  - platform: template
+    name: "RAW 0x50 (радон)"
+    id: raw_0x50
+    update_interval: never
+    icon: "mdi:hexadecimal"
+    web_server:
+      sorting_group_id: sg_diag
+  - platform: template
+    name: "RAW 0x51 (статус)"
+    id: raw_0x51
+    update_interval: never
+    icon: "mdi:hexadecimal"
+    web_server:
+      sorting_group_id: sg_diag
+  - platform: template
+    name: "RAW 0x54 (config)"
+    id: raw_0x54
+    update_interval: never
+    icon: "mdi:hexadecimal"
+    web_server:
+      sorting_group_id: sg_diag
+
+number:
+  - platform: template
+    name: "Интервал опроса (мин)"
+    id: poll_interval_min
+    min_value: 1
+    max_value: 60
+    step: 1
+    initial_value: 10
+    optimistic: true
+    restore_value: true
+    mode: slider
+    unit_of_measurement: "мин"
+    icon: "mdi:timer-cog-outline"
+    web_server:
+      sorting_group_id: sg_actions
+
+  # Коэффициент пересчёта радон→доза, нЗв/ч на 1 Bq/m³.
+  # Дефолт 1.8 ≈ WHO (100 Bq/m³ → ~1.6 мЗв/год при постоянном проживании, F=0.4).
+  # Это ингаляционная эффективная доза, НЕ сравнима с гамма-дозиметром.
+  - platform: template
+    name: "Коэффициент дозы радона"
+    id: dose_coeff
+    min_value: 0.1
+    max_value: 20
+    step: 0.1
+    initial_value: 1.8
+    optimistic: true
+    restore_value: true
+    mode: box
+    icon: "mdi:calculator-variant"
+    web_server:
+      sorting_group_id: sg_actions
+
+button:
+  - platform: template
+    name: "Опросить сейчас"
+    icon: "mdi:refresh"
+    web_server:
+      sorting_group_id: sg_actions
+    on_press:
+      - if:
+          condition:
+            lambda: "return id(ble_radon).connected();"
+          then:
+            - script.execute: poll_radon
+          else:
+            - lambda: |-
+                ESP_LOGW("radon", "Опрос пропущен, BLE не подключён");
+
+  - platform: safe_mode
+    name: "Safe Mode Boot"
+    web_server:
+      sorting_group_id: sg_actions
+
+  - platform: restart
+    name: "Перезагрузить"
+    web_server:
+      sorting_group_id: sg_actions
+
+  - platform: factory_reset
+    name: "Сбросить WiFi"
+    web_server:
+      sorting_group_id: sg_actions
+
+  # ── Народмон: ручной триггер ──
+  # HARD: switch narodmon_enabled управляет авто-отправкой по interval. Эта
+  # кнопка — ручной override (запускает send_narodmon независимо от switch).
+  # Не нажимать в production без явной причины.
+  - platform: template
+    name: "Отправить на Народмон сейчас"
+    id: narodmon_send_now
+    icon: "mdi:cloud-upload"
+    on_press:
+      - script.execute: send_narodmon
+    web_server:
+      sorting_group_id: sg_narodmon
+      sorting_weight: 200
+
+# ── Народмон: switch / select / text-поля имён метрик ──────────────────
+# HARD-правило проекта (CLAUDE.md, 2026-06-17): switch narodmon_enabled —
+# всегда restore_mode: ALWAYS_OFF (после ребута/safe-mode/factory_reset
+# гарантированно возвращается в OFF).
+switch:
+  - platform: template
+    name: "Выгружать на Народмон"
+    id: narodmon_enabled
+    icon: "mdi:cloud-upload"
+    restore_mode: ALWAYS_OFF
+    optimistic: true
+    web_server:
+      sorting_group_id: sg_narodmon
+      sorting_weight: 210
+
+select:
+  - platform: template
+    name: "Способ отправки на Народмон"
+    id: narodmon_method
+    icon: "mdi:upload-network"
+    optimistic: true
+    restore_value: true
+    initial_option: "HTTP GET"
+    options:
+      - "HTTP GET"
+      - "HTTP POST"
+      - "HTTPS POST"
+      - "JSON POST"
+    web_server:
+      sorting_group_id: sg_narodmon
+      sorting_weight: 220
+
+text:
+  - platform: template
+    name: "Имя метрики: радон"
+    id: nm_radon
+    optimistic: true
+    restore_value: true
+    initial_value: "RR1"
+    mode: text
+    icon: "mdi:tag-text"
+    web_server:
+      sorting_group_id: sg_narodmon
+      sorting_weight: 230
+
+  - platform: template
+    name: "Имя метрики: температура"
+    id: nm_temp
+    optimistic: true
+    restore_value: true
+    initial_value: "T1"
+    mode: text
+    icon: "mdi:tag-text"
+    web_server:
+      sorting_group_id: sg_narodmon
+      sorting_weight: 240
+
+  - platform: template
+    name: "Имя метрики: влажность"
+    id: nm_hum
+    optimistic: true
+    restore_value: true
+    initial_value: "H1"
+    mode: text
+    icon: "mdi:tag-text"
+    web_server:
+      sorting_group_id: sg_narodmon
+      sorting_weight: 250
+
+# ── Опрос: 0x50 (радон) → пауза 2с → 0x51 (uptime + часы) ───────────
+script:
+  - id: poll_radon
+    mode: restart
+    then:
+      - lambda: ESP_LOGI("radon", "=== Poll ===");
+      - ble_client.ble_write:
+          id: ble_radon
+          service_uuid: ${radon_svc}
+          characteristic_uuid: ${radon_tx}
+          value: [0x50]
+      - delay: 2s
+      - ble_client.ble_write:
+          id: ble_radon
+          service_uuid: ${radon_svc}
+          characteristic_uuid: ${radon_tx}
+          value: [0x51]
+      # ⚠ INC-RADON-UNIT (2026-06-16): 0x53 НЕ ОТПРАВЛЯТЬ — это НЕ read, а команда,
+      # меняющая настройки прибора: переключает единицы Bq/m³↔pCi/L и сбрасывает порог
+      # тревоги (C8=200→00 в кадре 0x54). 0x54/0x56 — безопасные read, но не нужны в
+      # операционном опросе. Опрашиваем только 0x50 (радон/peak/count) + 0x51 (uptime/T/H/часы).
+
+  # ── Народмон: отправка по выбранному протоколу ──
+  # MAC платы = WiFi.macAddress() (формат AA:BB:CC:DD:EE:FF, в ID шлём без двоеточий).
+  # Формат полезной нагрузки: ID=<MAC>&<RR1>=<radon>&<T1>=<temp>&<H1>=<hum>
+  # Где имена RR1/T1/H1 берутся из text-полей nm_radon/nm_temp/nm_hum.
+  # Все ветви guarded: wifi.connected + !isnan(s_radon.state) — без живых данных не шлём.
+  - id: send_narodmon
+    mode: restart
+    then:
+      - if:
+          condition:
+            and:
+              - wifi.connected:
+              - lambda: 'return !std::isnan(id(s_radon).state);'
+          then:
+            - lambda: |-
+                // Формируем общий body вида ID=<mac>&RR1=<radon>&T1=<temp>&H1=<hum>
+                std::string mac_id = esphome::get_mac_address();  // без двоеточий
+                float radon = id(s_radon).state;
+                char body[256];
+                int n = snprintf(body, sizeof(body),
+                  "ID=%s&%s=%.0f",
+                  mac_id.c_str(), id(nm_radon).state.c_str(), radon);
+                if (id(s_temp).has_state())
+                  n += snprintf(body+n, sizeof(body)-n,
+                    "&%s=%.1f", id(nm_temp).state.c_str(), id(s_temp).state);
+                if (id(s_humidity).has_state())
+                  n += snprintf(body+n, sizeof(body)-n,
+                    "&%s=%.0f", id(nm_hum).state.c_str(), id(s_humidity).state);
+                id(g_nm_body) = std::string(body);
+                ESP_LOGI("narodmon", "[%s] %s",
+                  id(narodmon_method).state.c_str(), body);
+            - if:
+                condition:
+                  lambda: 'return id(narodmon_method).state == "HTTP GET";'
+                then:
+                  - http_request.get:
+                      url: !lambda |-
+                        return std::string("http://narodmon.ru/get?") + id(g_nm_body);
+                      on_response:
+                        then:
+                          - lambda: |-
+                              ESP_LOGI("narodmon", "HTTP GET response received");
+            - if:
+                condition:
+                  lambda: 'return id(narodmon_method).state == "HTTP POST";'
+                then:
+                  - http_request.post:
+                      url: "http://narodmon.ru/post"
+                      body: !lambda 'return id(g_nm_body);'
+                      request_headers:
+                        Content-Type: "application/x-www-form-urlencoded"
+                      on_response:
+                        then:
+                          - lambda: |-
+                              ESP_LOGI("narodmon", "HTTP POST response received");
+            - if:
+                condition:
+                  lambda: 'return id(narodmon_method).state == "HTTPS POST";'
+                then:
+                  - http_request.post:
+                      url: "https://narodmon.ru/post"
+                      body: !lambda 'return id(g_nm_body);'
+                      request_headers:
+                        Content-Type: "application/x-www-form-urlencoded"
+                      on_response:
+                        then:
+                          - lambda: |-
+                              ESP_LOGI("narodmon", "HTTPS POST response received");
+            - if:
+                condition:
+                  lambda: 'return id(narodmon_method).state == "JSON POST";'
+                then:
+                  - http_request.post:
+                      url: "https://narodmon.ru/json"
+                      body: !lambda |-
+                        // Формат: {"devices":[{"mac":"<MAC>","sensors":[{"id":"RR1","value":<radon>}, ...]}]}
+                        std::string mac_id = esphome::get_mac_address();
+                        char j[512];
+                        int n = snprintf(j, sizeof(j),
+                          "{\"devices\":[{\"mac\":\"%s\",\"sensors\":["
+                          "{\"id\":\"%s\",\"value\":%.0f}",
+                          mac_id.c_str(),
+                          id(nm_radon).state.c_str(), id(s_radon).state);
+                        if (id(s_temp).has_state()) n += snprintf(j+n, sizeof(j)-n,
+                          ",{\"id\":\"%s\",\"value\":%.1f}",
+                          id(nm_temp).state.c_str(), id(s_temp).state);
+                        if (id(s_humidity).has_state()) n += snprintf(j+n, sizeof(j)-n,
+                          ",{\"id\":\"%s\",\"value\":%.0f}",
+                          id(nm_hum).state.c_str(), id(s_humidity).state);
+                        snprintf(j+n, sizeof(j)-n, "]}]}");
+                        return std::string(j);
+                      request_headers:
+                        Content-Type: "application/json"
+                      on_response:
+                        then:
+                          - lambda: |-
+                              ESP_LOGI("narodmon", "JSON POST response received");
+          else:
+            - lambda: |-
+                ESP_LOGW("narodmon", "skip: wifi=%d, radon_has_state=%d",
+                  (int)wifi::global_wifi_component->is_connected(),
+                  !std::isnan(id(s_radon).state) ? 1 : 0);
+
+# ── Периодический опрос по настраиваемому интервалу ──────────────────
+interval:
+  - interval: 60s
+    then:
+      - lambda: |-
+          static uint32_t last_poll = 0;
+          uint32_t now_s = millis() / 1000;
+          uint32_t intv = (uint32_t)id(poll_interval_min).state * 60;
+          if (intv < 60) intv = 60;
+          if (now_s - last_poll >= intv) {
+            last_poll = now_s;
+            if (id(ble_radon).connected()) {
+              id(poll_radon).execute();
+            } else {
+              ESP_LOGD("radon", "Poll skipped: not connected");
+            }
+          }
+
+  # ── Народмон: авто-отправка каждые 10 мин, ТОЛЬКО при switch == ON ──
+  # Народмон не любит чаще 5 мин (anti-spam → бан). 10 мин совпадает с poll_interval_min.
+  - interval: 600s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(narodmon_enabled).state;'
+          then:
+            - script.execute: send_narodmon

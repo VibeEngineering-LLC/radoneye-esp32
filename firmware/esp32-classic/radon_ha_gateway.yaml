@@ -1,0 +1,608 @@
+# ══════════════════════════════════════════════════════════════════════
+#  radon_ha_gateway.yaml — RadonEye Plus2 (RD200PLUS) → Home Assistant
+#
+#  BLE-шлюз: один RadonEye Plus2, опрос каждые 10 мин (= цикл прибора).
+#  HA native API: сенсоры автоматически появляются в HA после привязки.
+#
+#  Что отдаётся в HA:
+#    sensor.radon_instant      — радон мгновенный Bq/m³   (state_class: measurement)
+#    sensor.radon_pci          — то же в pCi/L
+#    sensor.radonye_uptime_min — uptime прибора, мин
+#    text_sensor.radon_last_updated — метка времени последнего замера (HH:MM DD.MM)
+#    text_sensor.radon_device_clock — часы прибора mm:ss (из 0x51)
+#    binary_sensor.radon_ble_connected
+#    sensor.radon_rssi
+#
+#  Протокол RadonEye Plus2 (live-verified 2026-06-15, plus2_protocol.md):
+#    Service UUID:  00001523-1212-efde-1523-785feabcd123
+#    TX (write):    00001524-1212-efde-1523-785feabcd123
+#    RX (notify):   00001525-1212-efde-1523-785feabcd123
+#    0x50 → 20B: [2:4] uint16 LE Bq/m³ (current), [18:20] cached mm:ss
+#    0x51 → 20B: [4:8] uint32 LE uptime мин, [18:20] live mm:ss
+#    Прибор обновляет показания каждые 10 мин.
+#    Часовые средние (0x60+0x61 bulk) — отдельный шаг; здесь только instant.
+#    HA Statistics → mean/hour из 10-мин readings вычисляет сам HA Recorder.
+# ══════════════════════════════════════════════════════════════════════
+
+substitutions:
+  device_name:    radon-ha-gateway
+  device_friendly: "RadonEye HA Gateway"
+  radon_svc:  "00001523-1212-efde-1523-785feabcd123"
+  radon_tx:   "00001524-1212-efde-1523-785feabcd123"
+  radon_rx:   "00001525-1212-efde-1523-785feabcd123"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${device_friendly}
+  comment: "RadonEye Plus2 BLE → HA"
+  build_path: D:/esp32_radon_build/radon-ha-gateway
+  on_boot:
+    priority: -300
+    then:
+      - lambda: |-
+          auto parse_mac = [](const std::string &s) -> uint64_t {
+            if (s.length() != 17) return 0;
+            uint64_t m = 0;
+            for (int i = 0; i < 6; i++) {
+              char h[3] = { s[i*3], s[i*3+1], 0 };
+              char *end = nullptr;
+              long v = strtol(h, &end, 16);
+              if (end == h || v < 0 || v > 255) return 0;
+              m = (m << 8) | (uint8_t)v;
+            }
+            return m;
+          };
+          uint64_t m = parse_mac(id(mac_radon).state);
+          if (m) {
+            id(ble_radon).set_address(m);
+            ESP_LOGI("boot", "RadonEye MAC from NVS: %s", id(mac_radon).state.c_str());
+          }
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# ── Логгер ───────────────────────────────────────────────────────────
+logger:
+  level: INFO
+  baud_rate: 115200
+
+# ── WiFi ─────────────────────────────────────────────────────────────
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none   # CRITICAL при BLE+WiFi одновременно
+  ap:
+    ssid: "radon-ha Fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+# ── Home Assistant native API ─────────────────────────────────────────
+api:
+  encryption:
+    key: !secret api_encryption_key
+  reboot_timeout: 0s   # не перезагружаться если HA недоступен
+
+# ── OTA ──────────────────────────────────────────────────────────────
+ota:
+  - platform: esphome
+    password: !secret ota_password
+  - platform: web_server
+
+# ── Web UI (ESPHome v3) ───────────────────────────────────────────────
+# HARD: log: false — без этого Debug Log SSE флудит → json:111 → near-OOM
+# HARD: auth: — режет phantom XRay keep-alive на 401 → LWIP-пул не исчерпывается
+web_server:
+  version: 3
+  port: 80
+  local: true
+  auth:
+    username: radon
+    password: !secret ota_password
+  log: false
+  sorting_groups:
+    - id: sg_sensors
+      name: "Показания радона"
+      sorting_weight: 10
+    - id: sg_ble
+      name: "Статус BLE"
+      sorting_weight: 20
+    - id: sg_settings
+      name: "Настройки"
+      sorting_weight: 30
+    - id: sg_scan
+      name: "Поиск BLE устройств"
+      sorting_weight: 40
+    - id: sg_actions
+      name: "Действия"
+      sorting_weight: 50
+    - id: sg_re
+      name: "RE / Отладка BLE"
+      sorting_weight: 60
+    - id: sg_diag
+      name: "Диагностика"
+      sorting_weight: 70
+
+mdns:
+  disabled: false
+
+# ── Время (для меток замеров) ─────────────────────────────────────────
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Moscow
+
+# ── Глобальные переменные ─────────────────────────────────────────────
+globals:
+  - id: g_radon_bq
+    type: float
+    restore_value: true
+    initial_value: "0.0"
+  - id: g_radon_ready
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: g_scan_active
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: g_scan_results
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: g_scan_count
+    type: int
+    restore_value: false
+    initial_value: "0"
+
+# ── BLE-сканер (для поиска MAC RadonEye и живого RSSI) ───────────────
+esp32_ble_tracker:
+  scan_parameters:
+    interval: 600ms
+    window: 180ms
+    active: true
+  on_ble_advertise:
+    - then:
+        - lambda: |-
+            std::string mac = x.address_str();
+            int rssi = x.get_rssi();
+            // Живой RSSI для настроенного устройства
+            if (id(mac_radon).state.length() == 17 && mac == id(mac_radon).state)
+              id(rssi_radon).publish_state((float)rssi);
+            // Накопление списка для UI-скана
+            if (!id(g_scan_active)) return;
+            std::string filter = id(scan_filter).state;
+            std::string name = x.get_name();
+            if (!filter.empty() && name.find(filter) == std::string::npos) return;
+            if (id(g_scan_results).find(mac) != std::string::npos) return;
+            char line[140];
+            snprintf(line, sizeof(line), "%s | %s | %d dBm\n",
+                     mac.c_str(), name.empty() ? "<no name>" : name.c_str(), rssi);
+            id(g_scan_results) += line;
+            id(g_scan_count) += 1;
+            id(found_devices).publish_state(id(g_scan_results));
+            ESP_LOGI("scan", "Found: %s (%s, %d dBm)", mac.c_str(), name.c_str(), rssi);
+
+# ── BLE клиент RadonEye Plus2 ─────────────────────────────────────────
+ble_client:
+  - mac_address: !secret radon1_mac   # заглушка; реальный MAC задаётся через Web UI
+    id: ble_radon
+    auto_connect: true
+    on_connect:
+      - lambda: ESP_LOGI("radon", "RadonEye Plus2 connected");
+      - delay: 600ms
+      - script.execute: poll_radon
+    on_disconnect:
+      - lambda: |-
+          ESP_LOGI("radon", "RadonEye Plus2 disconnected");
+          id(g_radon_ready) = false;
+
+# ══════════════════════════════════════════════════════════════════════
+#  SENSORS
+# ══════════════════════════════════════════════════════════════════════
+sensor:
+  # ── Основной notify-приёмник: обрабатывает и 0x50 (радон), и 0x51 (uptime/часы) ──
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: ble_radon
+    name: "Радон мгновенный"
+    id: s_radon
+    service_uuid: ${radon_svc}
+    characteristic_uuid: ${radon_rx}
+    notify: true
+    unit_of_measurement: "Bq/m³"
+    accuracy_decimals: 0
+    icon: "mdi:radioactive"
+    state_class: measurement
+    web_server:
+      sorting_group_id: sg_sensors
+    lambda: |-
+      // Hex-дамп → RE-сенсор
+      char hex[80]; size_t pos = 0;
+      for (size_t i = 0; i < x.size() && pos < 76; i++)
+        pos += snprintf(hex + pos, 80 - pos, "%02X ", x[i]);
+      id(raw_radon).publish_state(std::string(hex));
+
+      if (x.size() < 2) return NAN;
+
+      // 0x51: uptime minutes [4:8] u32 LE, live clock [18:20] mm:ss
+      if (x[0] == 0x51 && x.size() >= 20) {
+        uint32_t up = (uint32_t)x[4] | ((uint32_t)x[5]<<8)
+                    | ((uint32_t)x[6]<<16) | ((uint32_t)x[7]<<24);
+        id(s_uptime_min).publish_state((float)up);
+        char tbuf[8];
+        snprintf(tbuf, sizeof(tbuf), ":%02d:%02d", (int)x[18], (int)x[19]);
+        id(radon_device_clock).publish_state(std::string(tbuf));
+        return NAN;
+      }
+
+      // 0x50: instant radon [2:4] uint16 LE Bq/m³
+      if (x[0] != 0x50 || x.size() < 4) return NAN;
+      uint16_t bq_raw = (uint16_t)x[2] | ((uint16_t)x[3] << 8);
+      if (bq_raw > 9999) return NAN;
+      float bq = (float)bq_raw;
+      id(g_radon_bq) = bq;
+      id(g_radon_ready) = true;
+      // Производный pCi/L
+      id(s_radon_pci).publish_state(bq / 37.0f);
+      // Метка времени из SNTP
+      auto t = id(sntp_time).now();
+      if (t.is_valid()) {
+        char tbuf[20];
+        snprintf(tbuf, sizeof(tbuf), "%02d:%02d %02d.%02d",
+                 t.hour, t.minute, t.day_of_month, t.month);
+        id(radon_last_updated).publish_state(std::string(tbuf));
+      }
+      ESP_LOGI("radon", "RadonEye: %u Bq/m3 (%.3f pCi/L)", bq_raw, bq / 37.0f);
+      return bq;
+    filters:
+      - filter_out: nan
+
+  # pCi/L — публикуется из лямбды выше
+  - platform: template
+    name: "Радон (pCi⁄L)"
+    id: s_radon_pci
+    unit_of_measurement: "pCi/L"
+    accuracy_decimals: 3
+    icon: "mdi:radioactive"
+    state_class: measurement
+    update_interval: never
+    web_server:
+      sorting_group_id: sg_sensors
+
+  # Uptime прибора в минутах (из 0x51 [4:8])
+  - platform: template
+    name: "RadonEye uptime (мин)"
+    id: s_uptime_min
+    unit_of_measurement: "мин"
+    accuracy_decimals: 0
+    icon: "mdi:timer-outline"
+    state_class: total_increasing
+    update_interval: never
+    web_server:
+      sorting_group_id: sg_sensors
+
+  # Живой RSSI (из adv-пакетов, ≈1/с когда подключён)
+  - platform: template
+    name: "RSSI RadonEye"
+    id: rssi_radon
+    unit_of_measurement: "dBm"
+    accuracy_decimals: 0
+    update_interval: never
+    icon: "mdi:signal"
+    web_server:
+      sorting_group_id: sg_ble
+
+  - platform: wifi_signal
+    name: "WiFi сигнал"
+    update_interval: 60s
+    web_server:
+      sorting_group_id: sg_diag
+
+  - platform: uptime
+    name: "Uptime ESP32"
+    update_interval: 60s
+    web_server:
+      sorting_group_id: sg_diag
+
+# ══════════════════════════════════════════════════════════════════════
+#  BINARY SENSORS
+# ══════════════════════════════════════════════════════════════════════
+binary_sensor:
+  - platform: template
+    name: "BLE RadonEye подключён"
+    id: ble_radon_connected
+    icon: "mdi:bluetooth"
+    web_server:
+      sorting_group_id: sg_ble
+    lambda: "return id(ble_radon).connected();"
+
+# ══════════════════════════════════════════════════════════════════════
+#  TEXT SENSORS
+# ══════════════════════════════════════════════════════════════════════
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP адрес"
+      web_server:
+        sorting_group_id: sg_diag
+    mac_address:
+      name: "ESP32 MAC"
+      web_server:
+        sorting_group_id: sg_diag
+    ssid:
+      name: "WiFi сеть"
+      web_server:
+        sorting_group_id: sg_diag
+
+  # Время последнего замера (HH:MM DD.MM) — из SNTP в момент получения 0x50
+  - platform: template
+    name: "Время замера"
+    id: radon_last_updated
+    update_interval: never
+    icon: "mdi:clock-check-outline"
+    web_server:
+      sorting_group_id: sg_sensors
+
+  # Часы прибора mm:ss (из 0x51 [18:20]) — для проверки синхронизации
+  - platform: template
+    name: "Часы прибора mm:ss"
+    id: radon_device_clock
+    update_interval: never
+    icon: "mdi:clock-time-five-outline"
+    web_server:
+      sorting_group_id: sg_sensors
+
+  # RE-режим: сырой hex последнего notify
+  - platform: template
+    name: "Radon: сырой кадр (hex)"
+    id: raw_radon
+    update_interval: never
+    icon: "mdi:hexadecimal"
+    web_server:
+      sorting_group_id: sg_re
+
+  # BLE-сканер: список найденных устройств
+  - platform: template
+    name: "Найденные BLE устройства"
+    id: found_devices
+    update_interval: never
+    icon: "mdi:bluetooth-search"
+    web_server:
+      sorting_group_id: sg_scan
+
+  - platform: template
+    name: "Найдено устройств"
+    id: found_count_str
+    update_interval: 2s
+    icon: "mdi:counter"
+    web_server:
+      sorting_group_id: sg_scan
+    lambda: |-
+      char buf[24];
+      snprintf(buf, sizeof(buf), "%d (%s)", id(g_scan_count),
+               id(g_scan_active) ? "сканирую" : "стоп");
+      return std::string(buf);
+
+# ══════════════════════════════════════════════════════════════════════
+#  TEXT (пользовательские поля, хранятся в NVS)
+# ══════════════════════════════════════════════════════════════════════
+text:
+  # MAC RadonEye — задаётся через BLE-сканер; применяется после reboot
+  - platform: template
+    name: "MAC RadonEye (AA:BB:CC:DD:EE:FF)"
+    id: mac_radon
+    optimistic: true
+    restore_value: true
+    initial_value: ""
+    mode: text
+    web_server:
+      sorting_group_id: sg_scan
+
+  - platform: template
+    name: "Фильтр имени BLE (FR для RadonEye Plus2)"
+    id: scan_filter
+    optimistic: true
+    restore_value: true
+    initial_value: "FR"
+    mode: text
+    web_server:
+      sorting_group_id: sg_scan
+
+  # RE: произвольная hex-команда
+  - platform: template
+    name: "RE: hex-команда (без 0x, напр. 50)"
+    id: re_hex_cmd
+    optimistic: true
+    restore_value: true
+    initial_value: "50"
+    mode: text
+    web_server:
+      sorting_group_id: sg_re
+
+# ══════════════════════════════════════════════════════════════════════
+#  NUMBER
+# ══════════════════════════════════════════════════════════════════════
+number:
+  - platform: template
+    name: "Интервал опроса (мин)"
+    id: poll_interval_min
+    min_value: 1
+    max_value: 60
+    step: 1
+    initial_value: 10     # = цикл обновления RadonEye Plus2
+    optimistic: true
+    restore_value: true
+    mode: slider
+    unit_of_measurement: "мин"
+    icon: "mdi:timer-cog-outline"
+    web_server:
+      sorting_group_id: sg_settings
+
+# ══════════════════════════════════════════════════════════════════════
+#  BUTTONS
+# ══════════════════════════════════════════════════════════════════════
+button:
+  - platform: template
+    name: "Опросить сейчас [poll]"
+    id: btn_poll_now
+    icon: "mdi:refresh"
+    web_server:
+      sorting_group_id: sg_actions
+    on_press:
+      - if:
+          condition:
+            lambda: "return id(ble_radon).connected();"
+          then:
+            - script.execute: poll_radon
+          else:
+            - lambda: 'ESP_LOGW("radon", "Poll skipped: not connected");'
+
+  - platform: restart
+    name: "Перезагрузить [reboot]"
+    web_server:
+      sorting_group_id: sg_actions
+
+  - platform: factory_reset
+    name: "Сбросить WiFi [factory-reset]"
+    web_server:
+      sorting_group_id: sg_actions
+
+  # RE: ручные опкоды
+  - platform: template
+    name: "RE: → 0x50 (current radon)"
+    icon: "mdi:bluetooth-transfer"
+    web_server:
+      sorting_group_id: sg_re
+    on_press:
+      - ble_client.ble_write:
+          id: ble_radon
+          service_uuid: ${radon_svc}
+          characteristic_uuid: ${radon_tx}
+          value: [0x50]
+
+  - platform: template
+    name: "RE: → 0x51 (uptime + clock)"
+    icon: "mdi:bluetooth-transfer"
+    web_server:
+      sorting_group_id: sg_re
+    on_press:
+      - ble_client.ble_write:
+          id: ble_radon
+          service_uuid: ${radon_svc}
+          characteristic_uuid: ${radon_tx}
+          value: [0x51]
+
+  - platform: template
+    name: "RE: → произвольный hex [re-send]"
+    icon: "mdi:bluetooth-transfer"
+    web_server:
+      sorting_group_id: sg_re
+    on_press:
+      - ble_client.ble_write:
+          id: ble_radon
+          service_uuid: ${radon_svc}
+          characteristic_uuid: ${radon_tx}
+          value: !lambda |-
+            std::vector<uint8_t> out;
+            std::string s = id(re_hex_cmd).state;
+            for (size_t i = 0; i + 1 < s.length(); i += 2) {
+              char h[3] = { s[i], s[i+1], 0 };
+              out.push_back((uint8_t)strtol(h, nullptr, 16));
+            }
+            ESP_LOGI("re", "TX %u bytes", out.size());
+            return out;
+
+  # BLE-сканер
+  - platform: template
+    name: "Запустить скан BLE 30s [scan-start]"
+    id: btn_scan_start
+    icon: "mdi:bluetooth-search"
+    web_server:
+      sorting_group_id: sg_scan
+    on_press:
+      - lambda: |-
+          id(g_scan_results) = "";
+          id(g_scan_count) = 0;
+          id(found_devices).publish_state("");
+          id(g_scan_active) = true;
+          ESP_LOGI("scan", "Scan started (filter='%s')", id(scan_filter).state.c_str());
+      - delay: 30s
+      - lambda: |-
+          id(g_scan_active) = false;
+          ESP_LOGI("scan", "Scan done, found %d", id(g_scan_count));
+
+  - platform: template
+    name: "Стоп скан [scan-stop]"
+    id: btn_scan_stop
+    icon: "mdi:stop"
+    web_server:
+      sorting_group_id: sg_scan
+    on_press:
+      - lambda: "id(g_scan_active) = false;"
+
+  - platform: template
+    name: "Очистить список [scan-clear]"
+    icon: "mdi:broom"
+    web_server:
+      sorting_group_id: sg_scan
+    on_press:
+      - lambda: |-
+          id(g_scan_results) = "";
+          id(g_scan_count) = 0;
+          id(found_devices).publish_state("");
+
+  - platform: template
+    name: "Применить MAC и перезагрузить [apply-mac]"
+    id: btn_apply_mac
+    icon: "mdi:check-bold"
+    web_server:
+      sorting_group_id: sg_scan
+    on_press:
+      - lambda: "ESP_LOGI(\"mac\", \"Applying: %s\", id(mac_radon).state.c_str());"
+      - delay: 1s
+      - lambda: "App.safe_reboot();"
+
+# ══════════════════════════════════════════════════════════════════════
+#  SCRIPT — опрос: 0x50 (радон + метка) → 0x51 (uptime + часы прибора)
+# ══════════════════════════════════════════════════════════════════════
+script:
+  - id: poll_radon
+    mode: restart
+    then:
+      - lambda: |-
+          id(g_radon_ready) = false;
+          ESP_LOGI("radon", "=== Poll ===");
+      - ble_client.ble_write:
+          id: ble_radon
+          service_uuid: ${radon_svc}
+          characteristic_uuid: ${radon_tx}
+          value: [0x50]
+      - delay: 2s
+      - ble_client.ble_write:
+          id: ble_radon
+          service_uuid: ${radon_svc}
+          characteristic_uuid: ${radon_tx}
+          value: [0x51]
+
+# ══════════════════════════════════════════════════════════════════════
+#  INTERVAL — периодический опрос по настраиваемому интервалу
+# ══════════════════════════════════════════════════════════════════════
+interval:
+  - interval: 60s
+    then:
+      - lambda: |-
+          static uint32_t last_poll = 0;
+          uint32_t now_s = millis() / 1000;
+          uint32_t intv = (uint32_t)id(poll_interval_min).state * 60;
+          if (intv < 60) intv = 60;
+          if (now_s - last_poll >= intv) {
+            last_poll = now_s;
+            if (id(ble_radon).connected()) {
+              id(poll_radon).execute();
+            } else {
+              ESP_LOGD("radon", "Poll skipped: not connected");
+            }
+          }
