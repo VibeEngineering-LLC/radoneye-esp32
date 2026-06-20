@@ -5,10 +5,11 @@
 в ДВУХ интерпретациях сразу (uint16 LE Bq/m3 vs float32 LE pCi/L), чтобы по
 стабильности значений однозначно определить формат Plus2. Опкод 0x50 — whitelist.
 
-Usage:
-    "C:/Users/1/AppData/Local/Programs/Python/Python312/python.exe" plus2_poll.py
-    python plus2_poll.py --n 6 --gap 3
-    python plus2_poll.py --addr AA:BB:CC:DD:EE:FF   # либо подхват по имени FR:PD
+Usage (bleak требует Python 3.12):
+    python3.12 plus2_poll.py
+    python3.12 plus2_poll.py --n 6 --gap 3
+    python3.12 plus2_poll.py --addr AA:BB:CC:DD:EE:FF   # либо подхват по имени FR:PD
+    # Windows: py -3.12 plus2_poll.py ...
 """
 from __future__ import annotations
 import sys, asyncio, struct, argparse, time

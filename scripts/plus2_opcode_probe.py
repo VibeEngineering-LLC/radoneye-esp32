@@ -11,9 +11,10 @@ WHITELIST HARD: пишем ТОЛЬКО {0x10, 0xE8, 0xE9}. Диапазон 0xA
 Приватность: MAC и serial маскируются в выводе (mask_addr/mask_name) — лог безопасен
 для публикации/чтения.
 
-Usage:
-    "C:/Users/1/AppData/Local/Programs/Python/Python312/python.exe" plus2_opcode_probe.py
-    python plus2_opcode_probe.py --addr AA:BB:CC:DD:EE:FF --gap 6
+Usage (bleak требует Python 3.12):
+    python3.12 plus2_opcode_probe.py
+    python3.12 plus2_opcode_probe.py --addr AA:BB:CC:DD:EE:FF --gap 6
+    # Windows: py -3.12 plus2_opcode_probe.py ...
 """
 from __future__ import annotations
 import sys, asyncio, struct, argparse, time

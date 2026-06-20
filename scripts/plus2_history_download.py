@@ -17,14 +17,13 @@ RadonEye Plus2 (RD200PLUS) - live-загрузчик почасовой исто
     [4:6] uint16 LE  радон, Bq/m3
     [6:8] uint16 LE  температура, °C * 256 (Q8.8; /256)
 
-Usage (bleak только в Python312):
-    PY="C:/Users/1/AppData/Local/Programs/Python/Python312/python.exe"
+Usage (bleak требует Python 3.12; Windows — `py -3.12`, Linux — `python3.12`):
     # последние N часов (N свежих почасовых записей):
-    $PY plus2_history_download.py --mac AA:BB:CC:DD:EE:FF --hours 48
+    python3.12 plus2_history_download.py --mac AA:BB:CC:DD:EE:FF --hours 48
     # вся история (число записей берётся из ответа 0x60):
-    $PY plus2_history_download.py --mac AA:BB:CC:DD:EE:FF --all
+    python3.12 plus2_history_download.py --mac AA:BB:CC:DD:EE:FF --all
     # окно по датам (скачать всё, отфильтровать по встроенному ts):
-    $PY plus2_history_download.py --mac AA:BB:CC:DD:EE:FF --all --from 2026-06-01 --to 2026-06-10
+    python3.12 plus2_history_download.py --mac AA:BB:CC:DD:EE:FF --all --from 2026-06-01 --to 2026-06-10
     # поиск по adv-префиксу имени вместо MAC:
     $PY plus2_history_download.py --name-prefix FR:PD --all
 """

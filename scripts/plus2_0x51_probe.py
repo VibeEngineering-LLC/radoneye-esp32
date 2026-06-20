@@ -10,9 +10,10 @@
 
 WHITELIST HARD: пишем ТОЛЬКО {0x50, 0x51}. 0xA0..0xCF вне whitelist -> DFU-RISK.
 
-Usage:
-    "C:/Users/1/AppData/Local/Programs/Python/Python312/python.exe" plus2_0x51_probe.py
-    python plus2_0x51_probe.py --addr AA:BB:CC:DD:EE:FF --window 130 --gap 12
+Usage (bleak требует Python 3.12):
+    python3.12 plus2_0x51_probe.py
+    python3.12 plus2_0x51_probe.py --addr AA:BB:CC:DD:EE:FF --window 130 --gap 12
+    # Windows: py -3.12 plus2_0x51_probe.py ...
 """
 from __future__ import annotations
 import sys, asyncio, struct, argparse, time

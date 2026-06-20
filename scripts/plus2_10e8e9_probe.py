@@ -10,8 +10,9 @@
 WHITELIST HARD: пишем ТОЛЬКО {0x10, 0xE8, 0xE9} (+ 0x50 маркер). Всё в whitelist.
 0xA0..0xCF вне whitelist -> DFU-RISK, НЕ трогать.
 
-Usage:
-    "C:/Users/1/AppData/Local/Programs/Python/Python312/python.exe" plus2_10e8e9_probe.py
+Usage (bleak требует Python 3.12):
+    python3.12 plus2_10e8e9_probe.py
+    # Windows: py -3.12 plus2_10e8e9_probe.py
 """
 from __future__ import annotations
 import sys, asyncio, struct, argparse, time
