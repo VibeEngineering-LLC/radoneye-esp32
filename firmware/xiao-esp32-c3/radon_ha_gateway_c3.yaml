@@ -5,12 +5,16 @@
 #  БАЗА: radon_ha_gateway.yaml v2.0 (ESP32-DevKitC)
 #  ОТЛИЧИЯ: board=seeed_xiao_esp32c3, variant=esp32c3, framework=arduino (esp-idf не работает на Windows без MSYS2), build_path отдельный
 #
-#  Протокол RadonEye Plus2 (live-verified 2026-06-15, plus2_protocol.md):
+#  Протокол RadonEye Plus2 (live-verified 2026-06-15 + 2026-06-20, plus2_protocol.md):
 #    Service UUID: 00001523-1212-efde-1523-785feabcd123
 #    TX (write):   00001524-1212-efde-1523-785feabcd123
 #    RX (notify):  00001525-1212-efde-1523-785feabcd123
 #    0x50 [2:4]  uint16 LE Bq/m3 (instant radon)
-#    0x51 [4:8]  u32 LE uptime min, [18:20] live mm:ss
+#         [4:6]  uint16 LE Bq/m3 — 1d average (подтв. 2026-06-20: 0x0150=336)
+#         [6:8]  uint16 LE Bq/m3 — 2d average (подтв. 2026-06-20: 0x0141=321)
+#         [12:14] Peak, [14:16] Count, [16:18] secondary, [18:20] cache mm:ss
+#    0x51 [4:8]  u32 LE uptime min, [12] H = byte & 0x7F (подтв. 0xAE→46),
+#         [13] T °C int, [18:20] live mm:ss
 #
 #  Народмон-инфраструктура (step3 2026-06-17, по умолчанию ВЫКЛ):
 #    - switch narodmon_enabled — restore_mode: ALWAYS_OFF (HARD-правило проекта:
@@ -201,17 +205,16 @@ sensor:
       // 0x54: config blob (fw + настройки) — только дамп для разведки
       if (x[0] == 0x54) return NAN;
 
-      // 0x51: uptime [4:8] u32 LE, влажность [12], температура [13], часы [18:20]
+      // 0x51: uptime [4:8] u32 LE, H [12]&0x7F, T [13] int °C, часы [18:20]
       if (x[0] == 0x51 && x.size() >= 20) {
         uint32_t up = (uint32_t)x[4] | ((uint32_t)x[5]<<8)
                     | ((uint32_t)x[6]<<16) | ((uint32_t)x[7]<<24);
         id(s_uptime_min).publish_state((float)up);
-        // Температура: байт [13] целое °C — ПОДТВЕРЖДЕНО живым кадром (0x18=24 =
-        // дисплей T(C):24.0; ист. сверка 0x19/0x1A = 25/26°C май-июнь). Дробной части нет.
+        // T = байт[13] целое °C. Подтверждено: 0x18=24 при дисплее 24.5.
         id(s_temp).publish_state((float)x[13]);
-        // Влажность: байт [12] × 0.25 — ГИПОТЕЗА масштаба (0xA9=169 → 42.25 ≈ дисплей H:42;
-        // ист. 0xAA/A8/A7 → ~42%). Проверяется сравнением с дисплеем при разной влажности.
-        id(s_humidity).publish_state((float)x[12] * 0.25f);
+        // H = байт[12] & 0x7F (старший бит — флаг валидности).
+        // Подтверждено 2026-06-20: 0xAE & 0x7F = 0x2E = 46 ↔ дисплей H:46.
+        id(s_humidity).publish_state((float)(x[12] & 0x7F));
         char tbuf[8];
         snprintf(tbuf, sizeof(tbuf), ":%02d:%02d", (int)x[18], (int)x[19]);
         id(radon_clock).publish_state(std::string(tbuf));
@@ -223,6 +226,16 @@ sensor:
       if (bq_raw > 9999) return NAN;
       float bq = (float)bq_raw;
       id(g_radon_bq) = bq;
+
+      // 1d/2d средние [4:6]/[6:8] u16 LE Bq/m³ — ПОДТВЕРЖДЕНО дисплеем 2026-06-20
+      // (0x0150 = 336 ↔ «1d:336», 0x0141 = 321 ↔ «2d:321»). Поля пусты в первые сутки
+      // после батареек; заполняются после >24 ч / >48 ч непрерывной работы.
+      if (x.size() >= 8) {
+        uint16_t r1d = (uint16_t)x[4] | ((uint16_t)x[5] << 8);
+        uint16_t r2d = (uint16_t)x[6] | ((uint16_t)x[7] << 8);
+        if (r1d <= 9999) id(s_radon_1d).publish_state((float)r1d);
+        if (r2d <= 9999) id(s_radon_2d).publish_state((float)r2d);
+      }
 
       // Peak [12:14] u16 LE Bq/m³ — подтверждён дисплеем (Peak:18 ↔ 0x12 в кадре).
       // Count [14:16] u16 LE — номер замера, подтверждён дисплеем (Count:2 ↔ 0x02).
@@ -265,6 +278,28 @@ sensor:
   - platform: template
     name: "Средний радон за час"
     id: s_radon_1h
+    unit_of_measurement: "Bq/m³"
+    accuracy_decimals: 0
+    icon: "mdi:radioactive"
+    state_class: measurement
+    update_interval: never
+    web_server:
+      sorting_group_id: sg_sensors
+
+  - platform: template
+    name: "Средний радон за сутки (1d)"
+    id: s_radon_1d
+    unit_of_measurement: "Bq/m³"
+    accuracy_decimals: 0
+    icon: "mdi:radioactive"
+    state_class: measurement
+    update_interval: never
+    web_server:
+      sorting_group_id: sg_sensors
+
+  - platform: template
+    name: "Средний радон за двое суток (2d)"
+    id: s_radon_2d
     unit_of_measurement: "Bq/m³"
     accuracy_decimals: 0
     icon: "mdi:radioactive"
