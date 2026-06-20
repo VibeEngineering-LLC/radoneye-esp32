@@ -73,6 +73,7 @@ wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
   power_save_mode: none   # CRITICAL при BLE+WiFi одновременно
+  output_power: 8.5dB
   ap:
     ssid: "radon-ha Fallback"
     password: !secret ap_password
@@ -587,10 +588,23 @@ script:
           characteristic_uuid: ${radon_tx}
           value: [0x51]
 
+# ── LED heartbeat (GPIO2 — ESP32-DevKitC onboard LED) ────────────────
+output:
+  - platform: gpio
+    pin: GPIO2
+    id: heartbeat_led
+
 # ══════════════════════════════════════════════════════════════════════
 #  INTERVAL — периодический опрос по настраиваемому интервалу
 # ══════════════════════════════════════════════════════════════════════
 interval:
+  - interval: 2s
+    then:
+      - output.turn_on: heartbeat_led
+      - delay: 100ms
+      - output.turn_off: heartbeat_led
+
+
   - interval: 60s
     then:
       - lambda: |-

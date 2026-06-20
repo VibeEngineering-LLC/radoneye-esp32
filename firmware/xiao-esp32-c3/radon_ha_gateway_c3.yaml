@@ -57,6 +57,7 @@ wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
   power_save_mode: none
+  output_power: 8.5dB
   ap:
     ssid: "radon-gw Fallback"
     password: !secret ap_password
@@ -123,9 +124,7 @@ esp32_ble_tracker:
     window: 32ms
     active: true
 
-# ── BT proxy — плата заодно передаёт все BLE устройства в HA ──────────
-bluetooth_proxy:
-  active: true
+# bluetooth_proxy УБРАН (2026-06-21): WiFi-интерференция 2.4 ГГц → мешает соседним WiFi-устройствам.
 
 # ── BLE клиент RadonEye Plus2 ─────────────────────────────────────────
 ble_client:
@@ -724,8 +723,23 @@ script:
                   (int)wifi::global_wifi_component->is_connected(),
                   !std::isnan(id(s_radon).state) ? 1 : 0);
 
+# ── LED heartbeat (GPIO10 inverted — XIAO ESP32-C3 onboard LED) ──────
+output:
+  - platform: gpio
+    pin:
+      number: GPIO10
+      inverted: true
+    id: heartbeat_led
+
 # ── Периодический опрос по настраиваемому интервалу ──────────────────
 interval:
+  - interval: 2s
+    then:
+      - output.turn_on: heartbeat_led
+      - delay: 100ms
+      - output.turn_off: heartbeat_led
+
+
   - interval: 60s
     then:
       - lambda: |-

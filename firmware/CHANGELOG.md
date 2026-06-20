@@ -18,6 +18,15 @@
 
 ---
 
+## [unreleased] (2026-06-21)
+
+### Changed
+- Removed `bluetooth_proxy` from C3 YAML (WiFi 2.4 GHz interference with nearby devices).
+- Reduced WiFi TX power from 20 dBm to 8.5 dBm (`output_power: 8.5dB`) on both C3 and classic boards.
+- Added LED heartbeat (100 ms flash every 2 s) for visual board-alive indication (GPIO10 inverted on C3, GPIO2 on classic).
+
+---
+
 ## 2026-06-19 — реорганизация firmware/ по подпапкам
 
 **Что:** YAML-файлы прошивок переведены из плоской раскладки `firmware/*.yaml`
