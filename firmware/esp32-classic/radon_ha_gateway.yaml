@@ -507,13 +507,26 @@ button:
           service_uuid: ${radon_svc}
           characteristic_uuid: ${radon_tx}
           value: !lambda |-
+            // SAFE-WRITE WHITELIST: только read-опкоды, проверенные не вызывающие порчу прибора.
+            // 0x53 -> сброс конфига (INC-RADON-UNIT 2026-06-16); 0xA0..0xCF -> DFU mode.
+            // Любой байт вне whitelist => полная отмена записи, чтобы случайный ввод не окирпичил прибор.
+            static const uint8_t SAFE[] = {0x50, 0x51, 0x54, 0x56, 0x60, 0x61};
+            auto is_safe = [&](uint8_t b) {
+              for (uint8_t x : SAFE) if (x == b) return true;
+              return false;
+            };
             std::vector<uint8_t> out;
             std::string s = id(re_hex_cmd).state;
             for (size_t i = 0; i + 1 < s.length(); i += 2) {
               char h[3] = { s[i], s[i+1], 0 };
-              out.push_back((uint8_t)strtol(h, nullptr, 16));
+              uint8_t b = (uint8_t)strtol(h, nullptr, 16);
+              if (!is_safe(b)) {
+                ESP_LOGW("re", "ABORT TX: opkod 0x%02X vne whitelist (0x53 obnulit konfig, 0xA0..0xCF -> DFU)", b);
+                return std::vector<uint8_t>{};
+              }
+              out.push_back(b);
             }
-            ESP_LOGI("re", "TX %u bytes", out.size());
+            ESP_LOGI("re", "TX %u bytes (whitelist OK)", (unsigned)out.size());
             return out;
 
   # BLE-сканер

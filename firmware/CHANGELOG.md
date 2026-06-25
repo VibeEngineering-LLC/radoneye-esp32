@@ -107,7 +107,7 @@ v0.9.0-c3).
   - `0x50 [14:16]` → uint16 LE Count
   - `0x51 [4:8]` → uint32 LE uptime min
   - `0x51 [18:20]` → live mm:ss часы прибора
-- `esp32_ble_tracker.scan_parameters: interval: 640ms, window: 32ms, active: false` (duty 5 %, не резонирует с adv-периодом ~1 с).
+- `esp32_ble_tracker.scan_parameters: interval: 640ms, window: 32ms, active: true` (duty 5 %, не резонирует с adv-периодом ~1 с; активный скан — доп. air-time, но улучшает discovery Plus2 и стабильность `ble_client.connect()`).
 
 **Stability target:** длительный прогон в боевой эксплуатации с 2026-06-17.
 Конкретных метрик MTBF на момент публикации — нет.

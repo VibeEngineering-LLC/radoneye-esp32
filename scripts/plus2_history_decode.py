@@ -17,7 +17,8 @@ try:
 except Exception:
     pass
 
-sys.path.insert(0, __file__.rsplit("\\", 1)[0] if "\\" in __file__ else ".")
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from plus2_btsnoop_parse import parse
 
 CMD_HANDLE = 0x000b
@@ -84,6 +85,9 @@ def main():
     sz = recsize or 8
     nrec = len(stream) // sz
     print("\n=== record size %d -> %d records ===" % (sz, nrec))
+    if nrec == 0:
+        print("# (empty stream — nothing to decode)")
+        return
     if sz == 8:
         print("# HEAD (oldest):")
         for j in range(min(nrec, 16)):

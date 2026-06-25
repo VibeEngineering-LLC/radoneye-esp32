@@ -34,6 +34,9 @@ def parse(path, handle_filter=None):
     if data[:8] != BTSNOOP_MAGIC:
         print("Not a btsnoop file (bad magic): %r" % data[:8], file=sys.stderr)
         return []
+    if len(data) < 16:
+        print("# btsnoop: truncated header (size=%d)" % len(data), file=sys.stderr)
+        return []
     ver, dlt = struct.unpack(">II", data[8:16])
     print("# btsnoop version=%d datalink=%d size=%d" % (ver, dlt, len(data)), file=sys.stderr)
     off = 16

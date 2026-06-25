@@ -107,7 +107,7 @@ firmware versions. This is a structural change — paths in
   - `0x50 [14:16]` → uint16 LE Count
   - `0x51 [4:8]` → uint32 LE uptime min
   - `0x51 [18:20]` → device clock mm:ss (live)
-- `esp32_ble_tracker.scan_parameters: interval: 640ms, window: 32ms, active: false` (5 % duty cycle, doesn't resonate with the ~1 s adv period).
+- `esp32_ble_tracker.scan_parameters: interval: 640ms, window: 32ms, active: true` (5 % duty cycle, doesn't resonate with the ~1 s adv period; active scan adds air-time but improves Plus2 discovery and `ble_client.connect()` stability).
 
 **Stability target:** running in production since 2026-06-17.
 No specific MTBF figures at publication time.

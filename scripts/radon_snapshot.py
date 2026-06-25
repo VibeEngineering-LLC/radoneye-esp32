@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-RadonEye Plus2 / RD200P / Plus3 — production snapshot via V1 BLE protocol.
+RadonEye RD200P — V1-protocol snapshot (legacy/V1 firmware ONLY).
 
-Reads:
-  - current/day/month radon avg via opcode 0x50
-  - uptime (min + sec byte) and peak via opcode 0x51
+Reads (V1 frames):
+  - current/day/month radon avg via opcode 0x50 (float32 pCi/L)
+  - uptime + peak via opcode 0x51 (peak f32 at [12:16])
 
-Tested live on a RD200PLUS device (Plus2 family) on 2026-06-07.
+NOT for Plus2 (RD200PLUS) / Plus3: 0x50 layout differs (uint16 LE Bq/m³),
+float32 over Plus2 bytes denormalises to ~0 -> garbage. Use C3 firmware or
+scripts/plus2_poll.py for Plus2. See references/plus2_protocol.md §6.
+
+Last verified on RD200PLUS 2026-06-07; later RE proved Plus2-incompat (§6).
 
 Usage:
     python radon_snapshot.py                 # single snapshot
@@ -23,8 +27,11 @@ Constraints (read SKILL.md anti-patterns BEFORE editing):
     Opcodes in 0xA0..0xCF range have triggered DFU mode in the wild.
   - Do NOT keep the BLE central role longer than needed — the device allows
     exactly one central at a time, and a held connection blocks the phone app.
-  - Do NOT decode temperature/humidity from bytes 12/13 of 0x51 — those are
-    the peak f32, not temp/hum. See references/temp_humidity_research.md.
+  - V1 0x51 bytes [12:16] are peak f32, NOT temp/hum.
+  - Plus2 layout is different: 0x51 [12]=humidity (byte & 0x7F), [13]=temp °C.
+    See references/plus2_protocol.md §6 (2026-06-20, authoritative).
+    The older note in references/temp_humidity_research.md (2026-06-07) is
+    superseded and applies to V1 only.
 
 Requires: bleak (pip install bleak)
 """

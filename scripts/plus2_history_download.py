@@ -15,7 +15,10 @@ RadonEye Plus2 (RD200PLUS) - live-загрузчик почасовой исто
 Формат записи (8 байт, oldest->newest):
     [0:4] uint32 LE  Unix timestamp (ЛОКАЛЬНОЕ время прибора, шаг +3600 с)
     [4:6] uint16 LE  радон, Bq/m3
-    [6:8] uint16 LE  температура, °C * 256 (Q8.8; /256)
+    [6:8] uint16 LE  temp_raw — формат НЕ верифицирован (рабочая гипотеза Q8.8
+                     /256, но btsnoop-трасса 0x60/0x61 это НЕ подтвердила).
+                     До верификации публикуется как сырой uint16 + флаг
+                     `temp_unverified: true` (см. plus2_protocol.md §6A).
 
 Usage (bleak требует Python 3.12; Windows — `py -3.12`, Linux — `python3.12`):
     # последние N часов (N свежих почасовых записей):
@@ -47,17 +50,43 @@ OPCODE_DUMP  = 0x61
 REC_LEN      = 8
 MAX_RECORDS  = 9600   # из 0x60-трассы (~401 день почасовой истории)
 
+# Anti-DFU whitelist (см. SKILL.md / plus2_protocol.md §5).
+# Опкоды вне whitelist с высокой вероятностью переводят прибор в DFU mode
+# (recovery — вынуть батарейки ~30 с). НЕ расширять без верификации btsnoop.
+WHITELIST = frozenset({
+    0x10, 0x50, 0x51, 0x53, 0x54, 0x56,
+    0x60, 0x61,
+    0xA4, 0xA6, 0xA8, 0xAF,
+    0xE8, 0xE9,
+})
+
 
 def build_cmd(opcode: int, param: int = 0) -> bytes:
-    """20-байтовая команда: <opcode> 0x11 <param_u16_LE> 00 ...padding нулями."""
+    """20-байтовая команда: <opcode> 0x11 <param_u16_LE> 00 ...padding нулями.
+
+    Runtime-страж: opcode ОБЯЗАН быть в WHITELIST. Иначе RuntimeError —
+    write вообще не выполняется (предохранитель от DFU).
+    """
+    op = opcode & 0xFF
+    if op not in WHITELIST:
+        raise RuntimeError(
+            f"opcode 0x{op:02X} вне whitelist; 0xA0..0xCF -> DFU mode. "
+            "Расширять WHITELIST только после трассы btsnoop."
+        )
     buf = bytearray(20)
-    buf[0] = opcode & 0xFF
+    buf[0] = op
     buf[1] = 0x11
     struct.pack_into("<H", buf, 2, param & 0xFFFF)
     return bytes(buf)
 
 
 def decode_record(b: bytes) -> dict:
+    """8-байтовая запись: ts u32 LE | radon u16 LE | bytes[6:8] = "temp_raw" u16 LE.
+
+    Поле temp_raw НЕ декодируется в °C: формат Q8.8 (/256) — это рабочая
+    гипотеза 2026-06-15, она НЕ подтверждена btsnoop-трассой Plus2 §6А.
+    До верификации — публикуем сырое значение + флаг unverified.
+    """
     ts   = struct.unpack_from("<I", b, 0)[0]
     bq   = struct.unpack_from("<H", b, 4)[0]
     traw = struct.unpack_from("<H", b, 6)[0]
@@ -65,7 +94,8 @@ def decode_record(b: bytes) -> dict:
         "ts_unix": ts,
         "ts_local": datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "radon_bq_m3": bq,
-        "temp_c": round(traw / 256.0, 2),
+        "temp_raw": traw,
+        "temp_unverified": True,
     }
 
 
@@ -101,6 +131,9 @@ async def download(address: str, want: int) -> list[dict]:
         await asyncio.sleep(0.4)
 
         # 1) 0x60 - сколько записей хранит прибор
+        # Чистим преамбулу из notify_1525 ровно перед write, иначе при ranной
+        # выдаче `total` может «прийти» из случайного хвоста, не из ответа 0x60.
+        resp_1525.clear()
         await c.write_gatt_char(CMD_CHAR, build_cmd(OPCODE_COUNT), response=False)
         await asyncio.sleep(1.5)
         total = None
@@ -176,9 +209,10 @@ def save(recs, base):
         json.dump(recs, f, ensure_ascii=False, indent=2)
     with open(base + ".csv", "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["ts_unix", "ts_local", "radon_bq_m3", "temp_c"])
+        w.writerow(["ts_unix", "ts_local", "radon_bq_m3", "temp_raw", "temp_unverified"])
         for r in recs:
-            w.writerow([r["ts_unix"], r["ts_local"], r["radon_bq_m3"], r["temp_c"]])
+            w.writerow([r["ts_unix"], r["ts_local"], r["radon_bq_m3"],
+                        r["temp_raw"], r.get("temp_unverified", True)])
     print(f"[+] сохранено: {base}.json / {base}.csv", flush=True)
 
 
@@ -197,8 +231,8 @@ async def amain(a):
         recs = filter_by_date(recs, a.from_, a.to)
         print(f"[+] после фильтра по датам: {len(recs)} записей", flush=True)
     if recs:
-        print(f"    первая:    {recs[0]['ts_local']}  радон={recs[0]['radon_bq_m3']} Bq/m3  T={recs[0]['temp_c']}°C", flush=True)
-        print(f"    последняя: {recs[-1]['ts_local']}  радон={recs[-1]['radon_bq_m3']} Bq/m3  T={recs[-1]['temp_c']}°C", flush=True)
+        print(f"    первая:    {recs[0]['ts_local']}  радон={recs[0]['radon_bq_m3']} Bq/m3  temp_raw={recs[0]['temp_raw']} (unverified)", flush=True)
+        print(f"    последняя: {recs[-1]['ts_local']}  радон={recs[-1]['radon_bq_m3']} Bq/m3  temp_raw={recs[-1]['temp_raw']} (unverified)", flush=True)
     save(recs, a.out)
     return 0
 

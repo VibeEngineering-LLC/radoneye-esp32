@@ -234,7 +234,12 @@ esp32_ble_tracker:
   scan_parameters:
     interval: 640ms      # not a divisor of 1000ms, no phase lock
     window: 32ms         # 5 % duty cycle
-    active: false        # passive scan — name+RSSI come in the adv payload
+    active: true         # active scan (scan-response request). Extra
+                         # air-time vs BLE-WiFi coex, but improves
+                         # Plus2 discovery and ble_client.connect()
+                         # stability. See actual YAML
+                         # (esp32-classic/radon_ha_gateway.yaml:166,
+                         # xiao-esp32-c3/radon_ha_gateway_c3.yaml:125).
 ```
 
 ⚠ **Don't** change scan_parameters to `1000ms / 100ms` or `500ms /

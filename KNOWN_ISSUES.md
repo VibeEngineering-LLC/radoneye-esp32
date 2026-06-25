@@ -114,8 +114,10 @@
 
 **Решение.**
 
-- ✅ Whitelist опкодов в прошивке шлюза **жёсткий** (`{0x10, 0x50, 0x51, 0x53, 0x54, 0x56, 0x60, 0x61, 0xA4, 0xA6, 0xA8, 0xAF, 0xE8, 0xE9}`). Любой опкод вне whitelist в lambda-парсере шлюза **отвергается**.
-- Опкоды внутри whitelist в диапазоне `0xA0..0xCF` (`0xA4`, `0xA6`, `0xA8`, `0xAF`) — **подтверждены безопасными** трассой официального приложения RadonEye.
+- ✅ **Канонический whitelist «распознаётся прибором»** (`plus2_protocol.md §5`) — 14 опкодов: `{0x10, 0x50, 0x51, 0x53, 0x54, 0x56, 0x60, 0x61, 0xA4, 0xA6, 0xA8, 0xAF, 0xE8, 0xE9}`. ⚠ «Распознаётся» ≠ «безопасно слать»: `0x53` подтверждённо обнуляет конфиг (INC-RADON-UNIT 2026-06-16).
+- ✅ **Поллер шлюза (`poll_radon`) — литерал `[0x50]`/`[0x51]`**, других опкодов в эфир не отправляет (`firmware/esp32-classic/radon_ha_gateway.yaml:579-589`, `firmware/xiao-esp32-c3/radon_ha_gateway_c3.yaml:607-617`).
+- ✅ **SAFE-WRITE whitelist на кнопке `RE: → произвольный hex`** (только read-опкоды: `{0x50, 0x51, 0x54, 0x56, 0x60, 0x61}`, `firmware/esp32-classic/radon_ha_gateway.yaml:509-528`). Любой байт вне этого множества → полная отмена записи + `ESP_LOGW`. Защищает от ручного ввода `0x53` (сброс конфига) и `0xA0..0xCF` (DFU).
+- Опкоды внутри канонического whitelist в диапазоне `0xA0..0xCF` (`0xA4`, `0xA6`, `0xA8`, `0xAF`) — **распознаются прибором** и подтверждены не-DFU трассой официального приложения. На кнопке hex-ввода намеренно НЕ разрешены (только read-опкоды).
 - ⚠ Если разрабатываешь свой клиент — никогда не делай `for op in range(0xA0, 0xD0): write(op, 0x00, ...)`. Это инструмент DFU-погружения, а не reverse engineering.
 
 ### INC-PLUS2-SINGLE-CENTRAL — пока подключён телефон, ESP не коннектится
@@ -225,7 +227,12 @@ esp32_ble_tracker:
   scan_parameters:
     interval: 640ms      # не делитель 1000ms, нет фазового замка
     window: 32ms         # duty 5 %
-    active: false        # пассивный скан — имя+RSSI приходят в adv payload
+    active: true         # активный скан (запрос scan-response). Стоит
+                         # дополнительного air-time (BLE-WiFi coex),
+                         # но улучшает обнаружение Plus2 и стабильность
+                         # ble_client.connect(). См. реальные YAML
+                         # (esp32-classic/radon_ha_gateway.yaml:166,
+                         # xiao-esp32-c3/radon_ha_gateway_c3.yaml:125).
 ```
 
 ⚠ **Не правь** scan_parameters на `1000ms / 100ms` или `500ms / 50ms` — это

@@ -35,7 +35,13 @@ PROBE = [0x10, 0xE8, 0xE9]
 REPEATS = 3
 WINDOW = 10.0
 
-assert all(op in WHITELIST for op in PROBE), "opkod vne whitelist - stop"
+
+def _check_whitelist_or_abort(ops):
+    bad = [op for op in ops if op not in WHITELIST]
+    if bad:
+        print("ABORT: opkody vne whitelist:", [hex(x) for x in bad])
+        print("0xA0..0xCF -> DFU mode (vynut batareyki ~30s). Pravka PROBE bez probrosa cherez whitelist zapreschena.")
+        sys.exit(2)
 
 frames = []
 T0 = None
@@ -87,6 +93,9 @@ async def find_device(addr, name_prefix, timeout=12.0):
 
 async def write_and_listen(client, op, window):
     global _cur_op
+    if op not in WHITELIST:    # двойная защита в цикле: PYTHONOPTIMIZE срежет assert, runtime — нет
+        print("  [skip] op=0x%02x vne whitelist — propusk (DFU-RISK guard)" % op)
+        return 0
     _cur_op = op
     n0 = len(frames)
     print("  [write] op=0x%02x  slushayu %.0f s..." % (op, window))
@@ -106,6 +115,9 @@ async def main():
     ap.add_argument("--addr", default=ADDR)
     ap.add_argument("--window", type=float, default=WINDOW)
     args = ap.parse_args()
+
+    # runtime страж whitelist (assert вырезается под python -O — нельзя полагаться)
+    _check_whitelist_or_abort(PROBE + [0x50])
 
     print("[scan] addr=%s / name~%s ..." % (mask_addr(args.addr), NAME_PREFIX))
     dev, nm, rssi = await find_device(args.addr, NAME_PREFIX)

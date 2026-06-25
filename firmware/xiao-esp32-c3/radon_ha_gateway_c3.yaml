@@ -187,21 +187,7 @@ sensor:
     lambda: |-
       if (x.size() < 2) return NAN;
 
-      // ── РАЗВЕДКА (временно): hex-дамп сырого кадра по опкоду ──
-      // Цель — найти в live-кадрах влажность (H:42 = 0x2A) и температуру
-      // (T=24.0 → 0x18 целое / 0x18 0x00 в Q8.8). При известных T/H с дисплея
-      // ищем эти байты глазами в web UI. После локализации блок удалить.
-      {
-        char hb[8]; std::string hs;
-        size_t n = x.size() < 20 ? x.size() : 20;
-        for (size_t i = 0; i < n; i++) { snprintf(hb, sizeof(hb), "%02X ", x[i]); hs += hb; }
-        if (x[0] == 0x50)      id(raw_0x50).publish_state(hs);
-        else if (x[0] == 0x51) id(raw_0x51).publish_state(hs);
-        else if (x[0] == 0x54) id(raw_0x54).publish_state(hs);
-        ESP_LOGI("radon", "RAW %02X: %s", x[0], hs.c_str());
-      }
-
-      // 0x54: config blob (fw + настройки) — только дамп для разведки
+      // 0x54: config blob (fw + настройки) — оставлено как no-op, кадр игнорируется
       if (x[0] == 0x54) return NAN;
 
       // 0x51: uptime [4:8] u32 LE, H [12]&0x7F, T [13] int °C, часы [18:20]
@@ -250,6 +236,11 @@ sensor:
       id(s_dose).publish_state(bq * id(dose_coeff).state / 1000.0f);
 
       // ── Кольцевой буфер → среднее радона за последний час ──
+      // millis() wraps каждые ~49.7 сут. uint32_t-вычитание (now_s - hist_t)
+      // даёт корректную разницу даже через rollover (модульная арифметика),
+      // ПОКА реальная дельта < 2^31. Часовое окно (3600 с) << 2^31, поэтому
+      // окно остаётся точным; защищаемся от обратного случая, когда «свежий»
+      // отсчёт ещё не успел перезаписаться и hist_t > now_s на «много».
       uint32_t now_s = millis() / 1000;
       int hd = id(g_hist_head);
       id(g_hist_v)[hd] = bq;
@@ -258,7 +249,8 @@ sensor:
       if (id(g_hist_cnt) < 72) id(g_hist_cnt) += 1;
       float sum = 0; int cnt = 0;
       for (int i = 0; i < id(g_hist_cnt); i++) {
-        if (now_s - id(g_hist_t)[i] <= 3600) { sum += id(g_hist_v)[i]; cnt++; }
+        uint32_t dt = now_s - id(g_hist_t)[i];    // uint32 wrap-safe для дельт < 2^31
+        if (dt <= 3600u) { sum += id(g_hist_v)[i]; cnt++; }
       }
       if (cnt > 0) id(s_radon_1h).publish_state(sum / (float)cnt);
 
@@ -428,29 +420,6 @@ text_sensor:
     web_server:
       sorting_group_id: sg_sensors
 
-  # ── РАЗВЕДКА (временно): сырые кадры для поиска влажности/температуры ──
-  - platform: template
-    name: "RAW 0x50 (радон)"
-    id: raw_0x50
-    update_interval: never
-    icon: "mdi:hexadecimal"
-    web_server:
-      sorting_group_id: sg_diag
-  - platform: template
-    name: "RAW 0x51 (статус)"
-    id: raw_0x51
-    update_interval: never
-    icon: "mdi:hexadecimal"
-    web_server:
-      sorting_group_id: sg_diag
-  - platform: template
-    name: "RAW 0x54 (config)"
-    id: raw_0x54
-    update_interval: never
-    icon: "mdi:hexadecimal"
-    web_server:
-      sorting_group_id: sg_diag
-
 number:
   - platform: template
     name: "Интервал опроса (мин)"
@@ -569,6 +538,7 @@ text:
     restore_value: true
     initial_value: "RR1"
     mode: text
+    max_length: 16     # граница тела GET/JSON Народмона (см. snprintf-clamp ниже)
     icon: "mdi:tag-text"
     web_server:
       sorting_group_id: sg_narodmon
@@ -581,6 +551,7 @@ text:
     restore_value: true
     initial_value: "T1"
     mode: text
+    max_length: 16
     icon: "mdi:tag-text"
     web_server:
       sorting_group_id: sg_narodmon
@@ -593,6 +564,7 @@ text:
     restore_value: true
     initial_value: "H1"
     mode: text
+    max_length: 16
     icon: "mdi:tag-text"
     web_server:
       sorting_group_id: sg_narodmon
@@ -636,18 +608,28 @@ script:
           then:
             - lambda: |-
                 // Формируем общий body вида ID=<mac>&RR1=<radon>&T1=<temp>&H1=<hum>
+                // snprintf clamp: возвращает БЫ-длину; без clamp следующий snprintf уйдёт
+                // за буфер, а sizeof-n underflow'нёт size_t -> запись за стек.
                 std::string mac_id = esphome::get_mac_address();  // без двоеточий
                 float radon = id(s_radon).state;
                 char body[256];
                 int n = snprintf(body, sizeof(body),
                   "ID=%s&%s=%.0f",
                   mac_id.c_str(), id(nm_radon).state.c_str(), radon);
-                if (id(s_temp).has_state())
-                  n += snprintf(body+n, sizeof(body)-n,
+                if (n < 0) n = 0;
+                if (n >= (int)sizeof(body)) n = (int)sizeof(body) - 1;
+                if (id(s_temp).has_state()) {
+                  int m = snprintf(body+n, sizeof(body)-n,
                     "&%s=%.1f", id(nm_temp).state.c_str(), id(s_temp).state);
-                if (id(s_humidity).has_state())
-                  n += snprintf(body+n, sizeof(body)-n,
+                  if (m > 0) n += m;
+                  if (n >= (int)sizeof(body)) n = (int)sizeof(body) - 1;
+                }
+                if (id(s_humidity).has_state()) {
+                  int m = snprintf(body+n, sizeof(body)-n,
                     "&%s=%.0f", id(nm_hum).state.c_str(), id(s_humidity).state);
+                  if (m > 0) n += m;
+                  if (n >= (int)sizeof(body)) n = (int)sizeof(body) - 1;
+                }
                 id(g_nm_body) = std::string(body);
                 ESP_LOGI("narodmon", "[%s] %s",
                   id(narodmon_method).state.c_str(), body);
@@ -696,6 +678,7 @@ script:
                       url: "https://narodmon.ru/json"
                       body: !lambda |-
                         // Формат: {"devices":[{"mac":"<MAC>","sensors":[{"id":"RR1","value":<radon>}, ...]}]}
+                        // snprintf clamp на каждом шаге (см. формирование body выше).
                         std::string mac_id = esphome::get_mac_address();
                         char j[512];
                         int n = snprintf(j, sizeof(j),
@@ -703,12 +686,22 @@ script:
                           "{\"id\":\"%s\",\"value\":%.0f}",
                           mac_id.c_str(),
                           id(nm_radon).state.c_str(), id(s_radon).state);
-                        if (id(s_temp).has_state()) n += snprintf(j+n, sizeof(j)-n,
-                          ",{\"id\":\"%s\",\"value\":%.1f}",
-                          id(nm_temp).state.c_str(), id(s_temp).state);
-                        if (id(s_humidity).has_state()) n += snprintf(j+n, sizeof(j)-n,
-                          ",{\"id\":\"%s\",\"value\":%.0f}",
-                          id(nm_hum).state.c_str(), id(s_humidity).state);
+                        if (n < 0) n = 0;
+                        if (n >= (int)sizeof(j)) n = (int)sizeof(j) - 1;
+                        if (id(s_temp).has_state()) {
+                          int m = snprintf(j+n, sizeof(j)-n,
+                            ",{\"id\":\"%s\",\"value\":%.1f}",
+                            id(nm_temp).state.c_str(), id(s_temp).state);
+                          if (m > 0) n += m;
+                          if (n >= (int)sizeof(j)) n = (int)sizeof(j) - 1;
+                        }
+                        if (id(s_humidity).has_state()) {
+                          int m = snprintf(j+n, sizeof(j)-n,
+                            ",{\"id\":\"%s\",\"value\":%.0f}",
+                            id(nm_hum).state.c_str(), id(s_humidity).state);
+                          if (m > 0) n += m;
+                          if (n >= (int)sizeof(j)) n = (int)sizeof(j) - 1;
+                        }
                         snprintf(j+n, sizeof(j)-n, "]}]}");
                         return std::string(j);
                       request_headers:
